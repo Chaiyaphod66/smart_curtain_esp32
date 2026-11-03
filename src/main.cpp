@@ -1,14 +1,19 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <Wire.h>
 #include <BH1750.h>
 #include <DHT.h>
 #include <Preferences.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <esp_timer.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "secrets.h"
 
@@ -83,9 +88,16 @@ constexpr float MODEL_A_TEMPERATURE_HYSTERESIS_CELSIUS = 0.5F;
 constexpr float MODEL_A_TEMPERATURE_THRESHOLDS[] = {26.0F, 28.0F, 30.0F, 31.0F};
 constexpr float MODEL_A_HIGH_LUX_BY_BAND[] = {3000.0F, 2500.0F, 1500.0F, 900.0F, 600.0F};
 constexpr char MODEL_A_PRESET_ID[] = "model-a";
-constexpr char FIRMWARE_VERSION[] = "0.12.2";
+constexpr char FIRMWARE_VERSION[] = "0.13.0";
 constexpr char FALLBACK_AP_SSID[] = "smart_curtain";
 constexpr char FALLBACK_AP_PASSWORD[] = "password123";
+constexpr unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
+constexpr unsigned long MQTT_IDLE_PUBLISH_INTERVAL_MS = 2500;
+constexpr unsigned long MQTT_COMMAND_MAX_CLOCK_SKEW_MS = 2000;
+constexpr size_t MQTT_BUFFER_SIZE = 8192;
+constexpr char DEVICE_LOG_PATH[] = "/motion-log.jsonl";
+constexpr char DEVICE_LOG_ARCHIVE_PATH[] = "/motion-log.old.jsonl";
+constexpr size_t DEVICE_LOG_MAX_BYTES = 48 * 1024;
 
 enum class MotorDirection : uint8_t
 {
@@ -160,8 +172,38 @@ struct LimitStopDiagnostic
 LimitStopDiagnostic limitStopDiagnostic = {};
 
 WebServer server(80);
+WiFiClientSecure mqttSecureClient;
+PubSubClient mqttClient(mqttSecureClient);
 BH1750 lightMeter;
 DHT dht(DHT_PIN, DHT22);
+
+String mqttBaseTopic;
+String mqttCommandTopic;
+String mqttResultTopic;
+String mqttAvailabilityTopic;
+String mqttStatusTopic;
+String mqttSensorsTopic;
+String mqttEventTopic;
+unsigned long mqttLastConnectAttemptAt = 0;
+unsigned long mqttLastStatusPublishedAt = 0;
+unsigned long mqttLastSensorsSamplePublishedAt = 0;
+
+struct PendingDeviceLogEvent
+{
+  bool pending;
+  unsigned long uptimeMs;
+  unsigned long durationMs;
+  int32_t startEncoderCount;
+  int32_t stopEncoderCount;
+  int16_t targetPercent;
+  bool opening;
+  char reason[40];
+  char fault[40];
+};
+
+PendingDeviceLogEvent pendingDeviceLogEvent = {};
+int32_t motionStartEncoderCount = 0;
+bool deviceLogReady = false;
 
 bool lightSensorReady = false;
 
@@ -240,6 +282,16 @@ bool isModelAConfigured()
 
 void appendAutoStatusJson(String &response);
 void disableAutoForManualControl(const char *reason);
+String buildDeviceStatusJson();
+String buildSensorStatusJson();
+void queueDeviceLogEvent(
+    const char *reason,
+    const String &fault,
+    bool opening,
+    int targetPercent,
+    unsigned long startedAt,
+    int32_t startedCount,
+    int32_t stoppedCount);
 
 struct LimitSensorState
 {
@@ -1067,12 +1119,166 @@ void updateLimitStopDiagnostic(unsigned long currentTime)
   limitStopDiagnostic.settled = true;
 }
 
+void queueDeviceLogEvent(
+    const char *reason,
+    const String &fault,
+    bool opening,
+    int targetPercent,
+    unsigned long startedAt,
+    int32_t startedCount,
+    int32_t stoppedCount)
+{
+  pendingDeviceLogEvent.pending = true;
+  pendingDeviceLogEvent.uptimeMs = millis();
+  pendingDeviceLogEvent.durationMs = millis() - startedAt;
+  pendingDeviceLogEvent.startEncoderCount = startedCount;
+  pendingDeviceLogEvent.stopEncoderCount = stoppedCount;
+  pendingDeviceLogEvent.targetPercent = targetPercent;
+  pendingDeviceLogEvent.opening = opening;
+  snprintf(
+      pendingDeviceLogEvent.reason,
+      sizeof(pendingDeviceLogEvent.reason),
+      "%s",
+      reason);
+  snprintf(
+      pendingDeviceLogEvent.fault,
+      sizeof(pendingDeviceLogEvent.fault),
+      "%s",
+      fault.c_str());
+}
+
+String buildPendingDeviceEventJson()
+{
+  const time_t now = time(nullptr);
+  String response = "{";
+  response += "\"recordedAtEpoch\":";
+  response += now > 1700000000 ? String(static_cast<unsigned long>(now)) : "null";
+  response += ",\"uptimeMs\":" + String(pendingDeviceLogEvent.uptimeMs);
+  response += ",\"durationMs\":" + String(pendingDeviceLogEvent.durationMs);
+  response += ",\"direction\":\"";
+  response += pendingDeviceLogEvent.opening ? "open" : "close";
+  response += "\",\"targetPercent\":";
+  response += pendingDeviceLogEvent.targetPercent >= 0
+                  ? String(pendingDeviceLogEvent.targetPercent)
+                  : "null";
+  response += ",\"startEncoderCount\":" +
+              String(static_cast<long>(pendingDeviceLogEvent.startEncoderCount));
+  response += ",\"stopEncoderCount\":" +
+              String(static_cast<long>(pendingDeviceLogEvent.stopEncoderCount));
+  response += ",\"stopReason\":\"";
+  response += pendingDeviceLogEvent.reason;
+  response += "\",\"fault\":";
+  response += strlen(pendingDeviceLogEvent.fault) > 0
+                  ? "\"" + String(pendingDeviceLogEvent.fault) + "\""
+                  : "null";
+  response += "}";
+  return response;
+}
+
+void flushPendingDeviceLogEvent()
+{
+  if (!pendingDeviceLogEvent.pending || isMotorRunning)
+  {
+    return;
+  }
+
+  const String eventJson = buildPendingDeviceEventJson();
+
+  if (deviceLogReady)
+  {
+    File existing = LittleFS.open(DEVICE_LOG_PATH, FILE_READ);
+    const size_t existingSize = existing ? existing.size() : 0;
+    if (existing)
+    {
+      existing.close();
+    }
+
+    if (existingSize >= DEVICE_LOG_MAX_BYTES)
+    {
+      LittleFS.remove(DEVICE_LOG_ARCHIVE_PATH);
+      LittleFS.rename(DEVICE_LOG_PATH, DEVICE_LOG_ARCHIVE_PATH);
+    }
+
+    File logFile = LittleFS.open(DEVICE_LOG_PATH, FILE_APPEND);
+    if (logFile)
+    {
+      logFile.println(eventJson);
+      logFile.close();
+    }
+  }
+
+  if (MQTT_ENABLED && mqttClient.connected())
+  {
+    mqttClient.publish(mqttEventTopic.c_str(), eventJson.c_str(), false);
+  }
+
+  pendingDeviceLogEvent.pending = false;
+}
+
+String buildDeviceLogJson(size_t limit)
+{
+  if (!deviceLogReady ||
+      (!LittleFS.exists(DEVICE_LOG_PATH) &&
+       !LittleFS.exists(DEVICE_LOG_ARCHIVE_PATH)))
+  {
+    return "[]";
+  }
+
+  if (limit < 1) limit = 1;
+  if (limit > 50) limit = 50;
+
+  String entries[50];
+  size_t count = 0;
+  size_t cursor = 0;
+  const auto readLogFile = [&](const char *path)
+  {
+    File logFile = LittleFS.open(path, FILE_READ);
+    while (logFile && logFile.available())
+    {
+      String line = logFile.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+
+      entries[cursor] = line;
+      cursor = (cursor + 1) % limit;
+      if (count < limit) count++;
+    }
+    if (logFile) logFile.close();
+  };
+
+  // The archive is older, so consume it before the active file and keep only
+  // the newest requested entries across both files.
+  if (LittleFS.exists(DEVICE_LOG_ARCHIVE_PATH))
+  {
+    readLogFile(DEVICE_LOG_ARCHIVE_PATH);
+  }
+  if (LittleFS.exists(DEVICE_LOG_PATH))
+  {
+    readLogFile(DEVICE_LOG_PATH);
+  }
+
+  String response = "[";
+  const size_t start = count < limit ? 0 : cursor;
+  for (size_t index = 0; index < count; index++)
+  {
+    if (index > 0) response += ",";
+    response += entries[(start + index) % limit];
+  }
+  response += "]";
+  return response;
+}
+
 void stopMotor(
     const char *reason = "manual",
     bool useFastBrake = false,
     uint8_t brakeDuty = LIMIT_BRAKE_DUTY,
     unsigned long brakeDurationMs = LIMIT_BRAKE_DURATION_MS)
 {
+  const bool wasRunning = isMotorRunning;
+  const bool wasOpening = motorDirection == MotorDirection::Opening;
+  const int stoppedTargetPercent = positionTargetPercent;
+  const unsigned long stoppedStartedAt = motorStartedAt;
+
   if (useFastBrake && isMotorRunning)
   {
     // L298N active brake: keep ENA active briefly while both inputs are equal.
@@ -1097,6 +1303,19 @@ void stopMotor(
   motorDirection = MotorDirection::Stopped;
   motorStopReason = reason;
   Serial.println("Motor: STOP");
+
+  if (wasRunning)
+  {
+    queueDeviceLogEvent(
+        reason,
+        motorFault,
+        wasOpening,
+        stoppedTargetPercent,
+        stoppedStartedAt,
+        motionStartEncoderCount,
+        readEncoderSnapshot().count);
+    mqttLastStatusPublishedAt = millis() - MQTT_IDLE_PUBLISH_INTERVAL_MS;
+  }
 }
 
 void startMotor(bool forward)
@@ -1226,6 +1445,7 @@ void startMotor(bool forward)
   ledcWrite(PWM_CHANNEL, TEST_SPEED);
 
   motorStartedAt = millis();
+  motionStartEncoderCount = readEncoderSnapshot().count;
   isMotorRunning = true;
 }
 
@@ -1579,7 +1799,7 @@ void handleCorsPreflight()
   server.send(204, "text/plain", "");
 }
 
-void handleSensors()
+String buildSensorStatusJson()
 {
   const bool dht22Available =
       !isnan(currentTemperature) &&
@@ -1615,9 +1835,14 @@ void handleSensors()
 
   response += "}";
 
+  return response;
+}
+
+void handleSensors()
+{
   addCorsHeaders();
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", response);
+  server.send(200, "application/json", buildSensorStatusJson());
 }
 
 void handleHealth()
@@ -1658,7 +1883,7 @@ void handleHealth()
   server.send(200, "application/json", response);
 }
 
-void handleStatus()
+String buildDeviceStatusJson()
 {
   const bool dht22Available =
       !isnan(currentTemperature) &&
@@ -1913,9 +2138,31 @@ void handleStatus()
   response += "\"uptimeMs\":" + String(millis());
   response += "}";
 
+  return response;
+}
+
+void handleStatus()
+{
   addCorsHeaders();
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", response);
+  server.send(200, "application/json", buildDeviceStatusJson());
+}
+
+void handleDeviceLogs()
+{
+  size_t limit = 20;
+  if (server.hasArg("limit"))
+  {
+    const long requested = server.arg("limit").toInt();
+    if (requested > 0 && requested <= 50)
+    {
+      limit = static_cast<size_t>(requested);
+    }
+  }
+
+  addCorsHeaders();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", buildDeviceLogJson(limit));
 }
 
 void sendMotorResponse(const String &command)
@@ -2992,6 +3239,719 @@ void handleAutoDisable()
       saved ? "Continuous Auto disabled" : "Unable to persist Auto state");
 }
 
+String buildMotorCommandBody(
+    bool ok,
+    const String &command,
+    const String &message = "")
+{
+  String response = "{\"ok\":";
+  response += ok ? "true" : "false";
+  response += ",\"command\":\"" + command + "\"";
+  if (message.length() > 0)
+  {
+    response += ",\"message\":\"" + message + "\"";
+  }
+  response += "}";
+  return response;
+}
+
+String buildPositionCommandBody(const PositionMoveResult &result)
+{
+  String response = "{\"ok\":";
+  response += result.ok ? "true" : "false";
+  response += ",\"command\":\"position\",\"message\":\"";
+  response += result.message;
+  response += "\",\"targetPercent\":";
+  response += result.targetPercent >= 0
+                  ? String(result.targetPercent)
+                  : "null";
+  response += "}";
+  return response;
+}
+
+String buildCalibrationCommandBody(
+    bool ok,
+    const String &action,
+    const String &message)
+{
+  const EncoderSnapshot snapshot = readEncoderSnapshot();
+  String response = "{\"ok\":";
+  response += ok ? "true" : "false";
+  response += ",\"action\":\"" + action + "\",\"message\":\"";
+  response += message;
+  response += "\",\"encoderCount\":";
+  response += String(static_cast<long>(snapshot.count));
+  response += ",\"stage\":\"" + getCalibrationStage() + "\"}";
+  return response;
+}
+
+String buildAutoCommandBody(bool ok, const String &message)
+{
+  String response = "{\"ok\":";
+  response += ok ? "true" : "false";
+  response += ",\"message\":\"" + message + "\",\"auto\":";
+  appendAutoStatusJson(response);
+  response += "}";
+  return response;
+}
+
+void publishCloudCommandResult(
+    const String &id,
+    int statusCode,
+    const String &body)
+{
+  if (!MQTT_ENABLED || !mqttClient.connected())
+  {
+    return;
+  }
+
+  String response = "{\"id\":\"" + id + "\",\"status\":";
+  response += String(statusCode);
+  response += ",\"body\":" + body;
+  response += ",\"uptimeMs\":" + String(millis()) + "}";
+  mqttClient.publish(mqttResultTopic.c_str(), response.c_str(), false);
+}
+
+String getCloudParam(
+    JsonObjectConst params,
+    const char *name,
+    bool &found)
+{
+  JsonVariantConst value = params[name];
+  found = !value.isNull();
+  if (!found || !value.is<const char *>())
+  {
+    return "";
+  }
+  return String(value.as<const char *>());
+}
+
+bool parseCloudBoolean(
+    JsonObjectConst params,
+    const char *name,
+    bool &result)
+{
+  bool found = false;
+  const String value = getCloudParam(params, name, found);
+  if (!found) return false;
+  if (value == "1" || value == "true")
+  {
+    result = true;
+    return true;
+  }
+  if (value == "0" || value == "false")
+  {
+    result = false;
+    return true;
+  }
+  return false;
+}
+
+bool buildCloudAutoConfiguration(
+    JsonObjectConst params,
+    AutoConfiguration &nextConfiguration,
+    String &error)
+{
+  nextConfiguration = {};
+  nextConfiguration.version = AUTO_STORAGE_VERSION;
+  nextConfiguration.configured = true;
+  nextConfiguration.enabled = false;
+  bool found = false;
+
+  const String presetId = getCloudParam(params, "presetId", found);
+  if (!found || !isSafePresetId(presetId))
+  {
+    error = "Invalid preset id";
+    return false;
+  }
+  snprintf(
+      nextConfiguration.presetId,
+      sizeof(nextConfiguration.presetId),
+      "%s",
+      presetId.c_str());
+
+  const String responseStyle = getCloudParam(params, "responseStyle", found);
+  if (!found)
+  {
+    error = "Missing Auto response style";
+    return false;
+  }
+  if (responseStyle == "standard")
+  {
+    nextConfiguration.responseStyle = AutoResponseStyle::Standard;
+  }
+  else if (responseStyle == "gentle")
+  {
+    nextConfiguration.responseStyle = AutoResponseStyle::Gentle;
+  }
+  else
+  {
+    error = "Invalid Auto response style";
+    return false;
+  }
+
+  if (!parseCloudBoolean(
+          params,
+          "temperatureEnabled",
+          nextConfiguration.temperatureEnabled) ||
+      !parseCloudBoolean(
+          params,
+          "lightEnabled",
+          nextConfiguration.lightEnabled))
+  {
+    error = "Invalid sensor enable flags";
+    return false;
+  }
+
+  String value = getCloudParam(params, "closeAt", found);
+  if (!found || !parseStrictFloat(
+                    value,
+                    -20.0F,
+                    80.0F,
+                    nextConfiguration.closeAtOrAboveCelsius))
+  {
+    error = "Invalid temperature thresholds";
+    return false;
+  }
+  value = getCloudParam(params, "reopenAt", found);
+  if (!found || !parseStrictFloat(
+                    value,
+                    -20.0F,
+                    80.0F,
+                    nextConfiguration.reopenAtOrBelowCelsius))
+  {
+    error = "Invalid temperature thresholds";
+    return false;
+  }
+
+  long parsedValue = 0;
+  value = getCloudParam(params, "openTarget", found);
+  if (!found || !parseStrictLong(value, 0, 100, parsedValue))
+  {
+    error = "Invalid open target";
+    return false;
+  }
+  nextConfiguration.openTargetPercent = parsedValue;
+
+  value = getCloudParam(params, "closedTarget", found);
+  if (!found || !parseStrictLong(value, 0, 100, parsedValue))
+  {
+    error = "Invalid closed target";
+    return false;
+  }
+  nextConfiguration.closedTargetPercent = parsedValue;
+
+  value = getCloudParam(params, "confirmation", found);
+  if (!found || !parseStrictLong(value, 1, 10, parsedValue))
+  {
+    error = "Invalid confirmation count";
+    return false;
+  }
+  nextConfiguration.confirmationReadings = parsedValue;
+
+  value = getCloudParam(params, "cooldown", found);
+  if (!found || !parseStrictLong(value, 0, 3600, parsedValue))
+  {
+    error = "Invalid cooldown";
+    return false;
+  }
+  nextConfiguration.cooldownSeconds = parsedValue;
+
+  value = getCloudParam(params, "revision", found);
+  if (!found || !parseStrictLong(value, 0, 2147483647L, parsedValue))
+  {
+    error = "Invalid configuration revision";
+    return false;
+  }
+  nextConfiguration.clientRevision = static_cast<uint32_t>(parsedValue);
+
+  value = getCloudParam(params, "rangeCount", found);
+  if (!found || !parseStrictLong(
+                    value,
+                    0,
+                    MAX_AUTO_LIGHT_RANGES,
+                    parsedValue))
+  {
+    error = "Invalid light range count";
+    return false;
+  }
+  nextConfiguration.lightRangeCount = parsedValue;
+
+  for (uint8_t index = 0;
+       index < nextConfiguration.lightRangeCount;
+       index++)
+  {
+    const String prefix = "range" + String(index);
+    AutoLightRange &range = nextConfiguration.lightRanges[index];
+
+    value = getCloudParam(params, (prefix + "Min").c_str(), found);
+    if (!found || !parseStrictFloat(
+                      value,
+                      0.0F,
+                      1000000.0F,
+                      range.minLux))
+    {
+      error = "Invalid light range minimum";
+      return false;
+    }
+
+    value = getCloudParam(params, (prefix + "Max").c_str(), found);
+    if (!found)
+    {
+      error = "Missing light range maximum";
+      return false;
+    }
+    range.openEnded = value == "null";
+    if (!range.openEnded &&
+        !parseStrictFloat(value, 0.0F, 1000000.0F, range.maxLux))
+    {
+      error = "Invalid light range maximum";
+      return false;
+    }
+
+    value = getCloudParam(params, (prefix + "Target").c_str(), found);
+    if (!found || !parseStrictLong(value, 0, 100, parsedValue))
+    {
+      error = "Invalid light range target";
+      return false;
+    }
+    range.targetPercent = parsedValue;
+  }
+
+  return validateAutoConfiguration(nextConfiguration, error);
+}
+
+void executeCloudCommand(
+    const String &id,
+    const String &path,
+    JsonObjectConst params)
+{
+  if (path == "/system/logs")
+  {
+    bool found = false;
+    const String requestedLimit = getCloudParam(params, "limit", found);
+    long parsedLimit = 20;
+    if (found && !parseStrictLong(requestedLimit, 1, 20, parsedLimit))
+    {
+      publishCloudCommandResult(
+          id,
+          400,
+          "{\"ok\":false,\"message\":\"Invalid log limit\"}");
+      return;
+    }
+    const String logs = buildDeviceLogJson(static_cast<size_t>(parsedLimit));
+    publishCloudCommandResult(
+        id,
+        200,
+        "{\"ok\":true,\"logs\":" + logs + "}");
+    return;
+  }
+
+  if (path == "/motor/stop")
+  {
+    disableAutoForManualControl("Cloud STOP command");
+    positionTargetPercent = -1;
+    stopMotor();
+    publishCloudCommandResult(id, 200, buildMotorCommandBody(true, "stop"));
+    return;
+  }
+
+  if (path == "/motor/open" || path == "/motor/close")
+  {
+    const bool opening = path == "/motor/open";
+    const String command = opening ? "open" : "close";
+    disableAutoForManualControl(
+        opening ? "Cloud open command" : "Cloud close command");
+    startMotor(opening);
+    if (!isMotorRunning)
+    {
+      publishCloudCommandResult(
+          id,
+          409,
+          buildMotorCommandBody(
+              false,
+              command,
+              motorFault.length() ? motorFault : "motor-did-not-start"));
+      return;
+    }
+    publishCloudCommandResult(id, 200, buildMotorCommandBody(true, command));
+    return;
+  }
+
+  if (path == "/motor/open-until-limit" ||
+      path == "/motor/close-until-limit")
+  {
+    const bool opening = path == "/motor/open-until-limit";
+    const String command = opening
+                               ? "open-until-limit"
+                               : "close-until-limit";
+    disableAutoForManualControl(
+        opening ? "Cloud open-limit command" : "Cloud close-limit command");
+
+    if (!LIMIT_SAFETY_ENABLED)
+    {
+      publishCloudCommandResult(
+          id,
+          409,
+          buildMotorCommandBody(false, command, "Limit sensors disabled"));
+      return;
+    }
+    if (isLimitRawActive(closedLimit) && isLimitRawActive(openLimit))
+    {
+      motorFault = "limit-conflict";
+      stopMotor("limit-conflict", isMotorRunning);
+      publishCloudCommandResult(
+          id,
+          409,
+          buildMotorCommandBody(false, command, motorFault));
+      return;
+    }
+    if ((opening && isLimitRawActive(openLimit)) ||
+        (!opening && isLimitRawActive(closedLimit)))
+    {
+      motorFault = "";
+      stopMotor(opening ? "open-limit" : "closed-limit", isMotorRunning);
+      if (opening) synchronizeOpenLimitPosition();
+      else synchronizeClosedLimitPosition();
+      publishCloudCommandResult(id, 200, buildMotorCommandBody(true, command));
+      return;
+    }
+
+    startMotor(opening);
+    if (!isMotorRunning)
+    {
+      publishCloudCommandResult(
+          id,
+          409,
+          buildMotorCommandBody(
+              false,
+              command,
+              motorFault.length() ? motorFault : "motor-did-not-start"));
+      return;
+    }
+    limitTestActive = true;
+    publishCloudCommandResult(id, 200, buildMotorCommandBody(true, command));
+    return;
+  }
+
+  if (path == "/motor/position")
+  {
+    bool found = false;
+    const String percent = getCloudParam(params, "percent", found);
+    long parsedPercent = -1;
+    if (!found || !parseStrictLong(percent, 0, 100, parsedPercent))
+    {
+      const PositionMoveResult invalid = {
+          400, false, false, "Invalid percent", -1};
+      publishCloudCommandResult(id, 400, buildPositionCommandBody(invalid));
+      return;
+    }
+    disableAutoForManualControl("Cloud position command");
+    const PositionMoveResult result = startPositionMove(parsedPercent);
+    publishCloudCommandResult(
+        id,
+        result.statusCode,
+        buildPositionCommandBody(result));
+    return;
+  }
+
+  if (path.startsWith("/calibration/"))
+  {
+    disableAutoForManualControl("Cloud calibration command");
+    stopMotor();
+
+    if (path == "/calibration/closed")
+    {
+      synchronizeClosedLimitPosition();
+      publishCloudCommandResult(
+          id,
+          200,
+          buildCalibrationCommandBody(
+              true,
+              "set-closed",
+              "Closed position saved"));
+      return;
+    }
+
+    if (path == "/calibration/open")
+    {
+      if (!calibrationClosedSet)
+      {
+        publishCloudCommandResult(
+            id,
+            409,
+            buildCalibrationCommandBody(
+                false,
+                "set-open",
+                "Set closed position first"));
+        return;
+      }
+      const EncoderSnapshot snapshot = readEncoderSnapshot();
+      const int64_t difference =
+          static_cast<int64_t>(snapshot.count) - calibrationClosedCount;
+      const int64_t travelPulses = difference < 0 ? -difference : difference;
+      if (travelPulses < MIN_CALIBRATION_TRAVEL_PULSES)
+      {
+        publishCloudCommandResult(
+            id,
+            409,
+            buildCalibrationCommandBody(
+                false,
+                "set-open",
+                "Travel is too short"));
+        return;
+      }
+      calibrationOpenCount = snapshot.count;
+      calibrationOpenSet = true;
+      const bool saved = saveStoredCalibration();
+      publishCloudCommandResult(
+          id,
+          saved ? 200 : 500,
+          buildCalibrationCommandBody(
+              saved,
+              "set-open",
+              saved
+                  ? "Open position saved permanently"
+                  : "Open position set, but persistent save failed"));
+      return;
+    }
+
+    if (path == "/calibration/reset")
+    {
+      calibrationClosedSet = false;
+      calibrationOpenSet = false;
+      calibrationClosedCount = 0;
+      calibrationOpenCount = 0;
+      const bool cleared = clearStoredCalibration();
+      publishCloudCommandResult(
+          id,
+          cleared ? 200 : 500,
+          buildCalibrationCommandBody(
+              cleared,
+              "reset",
+              cleared
+                  ? "Calibration cleared"
+                  : "Runtime calibration cleared, but storage clear failed"));
+      return;
+    }
+  }
+
+  if (path == "/auto/model-a")
+  {
+    if (isMotorRunning)
+    {
+      publishCloudCommandResult(
+          id,
+          409,
+          buildAutoCommandBody(false, "Stop the motor before configuring Model A"));
+      return;
+    }
+    AutoConfiguration nextConfiguration = {};
+    nextConfiguration.version = AUTO_STORAGE_VERSION;
+    nextConfiguration.configured = true;
+    nextConfiguration.enabled = false;
+    nextConfiguration.responseStyle = AutoResponseStyle::Gentle;
+    nextConfiguration.temperatureEnabled = true;
+    nextConfiguration.lightEnabled = true;
+    nextConfiguration.confirmationReadings = 2;
+    nextConfiguration.cooldownSeconds = 15;
+    nextConfiguration.clientRevision = 1;
+    snprintf(
+        nextConfiguration.presetId,
+        sizeof(nextConfiguration.presetId),
+        "%s",
+        MODEL_A_PRESET_ID);
+    autoConfig = nextConfiguration;
+    resetAutoRuntimeState("dry-run", "Model A configured; Auto remains disabled");
+    const bool saved = saveAutoConfiguration();
+    publishCloudCommandResult(
+        id,
+        saved ? 200 : 500,
+        buildAutoCommandBody(
+            saved,
+            saved
+                ? "Model A configured in dry-run mode"
+                : "Unable to save Model A configuration"));
+    return;
+  }
+
+  if (path == "/auto/config")
+  {
+    AutoConfiguration nextConfiguration = {};
+    String validationError;
+    if (!buildCloudAutoConfiguration(params, nextConfiguration, validationError))
+    {
+      publishCloudCommandResult(
+          id,
+          400,
+          buildAutoCommandBody(false, validationError));
+      return;
+    }
+    if (autoCommandActive && isMotorRunning)
+    {
+      stopMotor(
+          "auto-config-updated",
+          true,
+          POSITION_BRAKE_DUTY,
+          POSITION_BRAKE_DURATION_MS);
+    }
+    autoConfig = nextConfiguration;
+    resetAutoRuntimeState("dry-run", "Configuration saved; Auto remains disabled");
+    const bool saved = saveAutoConfiguration();
+    publishCloudCommandResult(
+        id,
+        saved ? 200 : 500,
+        buildAutoCommandBody(
+            saved,
+            saved
+                ? "Auto configuration saved in dry-run mode"
+                : "Unable to save Auto configuration"));
+    return;
+  }
+
+  if (path == "/auto/enable")
+  {
+    String validationError;
+    if (!validateAutoConfiguration(autoConfig, validationError))
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, validationError));
+      return;
+    }
+    if (!LIMIT_SAFETY_ENABLED)
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, "Limit safety is disabled"));
+      return;
+    }
+    if (isLimitRawActive(closedLimit) && isLimitRawActive(openLimit))
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, "Limit sensor conflict"));
+      return;
+    }
+    if (!calibrationClosedSet || !calibrationOpenSet)
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, "Calibration required"));
+      return;
+    }
+    if (isMotorRunning)
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, "Motor is currently running"));
+      return;
+    }
+    if (motorFault.length() > 0)
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, "Clear motor fault before enabling Auto"));
+      return;
+    }
+    if ((autoConfig.temperatureEnabled && isnan(currentTemperature)) ||
+        (autoConfig.lightEnabled && isnan(currentLux)))
+    {
+      publishCloudCommandResult(id, 409, buildAutoCommandBody(false, "Required sensor data is unavailable"));
+      return;
+    }
+    autoConfig.enabled = true;
+    resetAutoRuntimeState("waiting", "Auto enabled; waiting for fresh sensor readings");
+    if (!saveAutoConfiguration())
+    {
+      autoConfig.enabled = false;
+      publishCloudCommandResult(id, 500, buildAutoCommandBody(false, "Unable to persist Auto state"));
+      return;
+    }
+    publishCloudCommandResult(id, 200, buildAutoCommandBody(true, "Continuous Auto enabled"));
+    return;
+  }
+
+  if (path == "/auto/disable")
+  {
+    if (autoCommandActive && isMotorRunning)
+    {
+      stopMotor(
+          "auto-disabled",
+          true,
+          POSITION_BRAKE_DUTY,
+          POSITION_BRAKE_DURATION_MS);
+    }
+    autoConfig.enabled = false;
+    resetAutoRuntimeState("disabled", "Auto disabled by user");
+    const bool saved = !autoConfig.configured || saveAutoConfiguration();
+    publishCloudCommandResult(
+        id,
+        saved ? 200 : 500,
+        buildAutoCommandBody(
+            saved,
+            saved ? "Continuous Auto disabled" : "Unable to persist Auto state"));
+    return;
+  }
+
+  publishCloudCommandResult(
+      id,
+      404,
+      "{\"ok\":false,\"message\":\"Unsupported command\"}");
+}
+
+bool isSafeCloudCommandId(const String &id)
+{
+  if (id.length() < 8 || id.length() > 64) return false;
+  for (size_t index = 0; index < id.length(); index++)
+  {
+    const char character = id.charAt(index);
+    if (!isAlphaNumeric(character) && character != '-') return false;
+  }
+  return true;
+}
+
+void handleMqttMessage(char *topic, byte *payload, unsigned int length)
+{
+  if (String(topic) != mqttCommandTopic || length == 0 || length > 4096)
+  {
+    return;
+  }
+
+  JsonDocument document;
+  const DeserializationError parseError =
+      deserializeJson(document, payload, length);
+  if (parseError)
+  {
+    Serial.println("MQTT: invalid command JSON");
+    return;
+  }
+
+  const String id = document["id"] | "";
+  const String path = document["path"] | "";
+  if (!isSafeCloudCommandId(id) || path.length() == 0)
+  {
+    return;
+  }
+
+  static String lastCommandId;
+  if (id == lastCommandId)
+  {
+    publishCloudCommandResult(
+        id,
+        409,
+        "{\"ok\":false,\"message\":\"Duplicate command\"}");
+    return;
+  }
+
+  const uint64_t expiresAt = document["expiresAt"] | 0ULL;
+  const time_t nowSeconds = time(nullptr);
+  if (nowSeconds > 1700000000 && expiresAt > 0)
+  {
+    const uint64_t nowMs = static_cast<uint64_t>(nowSeconds) * 1000ULL;
+    if (nowMs > expiresAt + MQTT_COMMAND_MAX_CLOCK_SKEW_MS)
+    {
+      publishCloudCommandResult(
+          id,
+          408,
+          "{\"ok\":false,\"message\":\"Cloud command expired\"}");
+      return;
+    }
+  }
+
+  lastCommandId = id;
+  JsonObjectConst params = document["params"].as<JsonObjectConst>();
+  executeCloudCommand(id, path, params);
+}
+
 bool evaluateAutoTargetPercent(
     int &targetPercent,
     String &reason)
@@ -3502,6 +4462,50 @@ bool connectToStation()
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+
+  if (WIFI_USE_STATIC_IPV4)
+  {
+    const IPAddress localIp(
+        WIFI_STATIC_IPV4[0],
+        WIFI_STATIC_IPV4[1],
+        WIFI_STATIC_IPV4[2],
+        WIFI_STATIC_IPV4[3]);
+    const IPAddress gateway(
+        WIFI_GATEWAY_IPV4[0],
+        WIFI_GATEWAY_IPV4[1],
+        WIFI_GATEWAY_IPV4[2],
+        WIFI_GATEWAY_IPV4[3]);
+    const IPAddress subnet(
+        WIFI_SUBNET_MASK_IPV4[0],
+        WIFI_SUBNET_MASK_IPV4[1],
+        WIFI_SUBNET_MASK_IPV4[2],
+        WIFI_SUBNET_MASK_IPV4[3]);
+    const IPAddress primaryDns(
+        WIFI_PRIMARY_DNS_IPV4[0],
+        WIFI_PRIMARY_DNS_IPV4[1],
+        WIFI_PRIMARY_DNS_IPV4[2],
+        WIFI_PRIMARY_DNS_IPV4[3]);
+    const IPAddress secondaryDns(
+        WIFI_SECONDARY_DNS_IPV4[0],
+        WIFI_SECONDARY_DNS_IPV4[1],
+        WIFI_SECONDARY_DNS_IPV4[2],
+        WIFI_SECONDARY_DNS_IPV4[3]);
+
+    if (!WiFi.config(
+            localIp,
+            gateway,
+            subnet,
+            primaryDns,
+            secondaryDns))
+    {
+      Serial.println("Wi-Fi static IPv4 configuration failed");
+      return false;
+    }
+
+    Serial.print("Wi-Fi static IPv4: ");
+    Serial.println(localIp);
+  }
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   const unsigned long startedAt = millis();
@@ -3612,6 +4616,129 @@ bool startFallbackAccessPoint()
   return true;
 }
 
+void initializeMqttBridge()
+{
+  if (!MQTT_ENABLED)
+  {
+    Serial.println("MQTT cloud: disabled");
+    return;
+  }
+
+  mqttBaseTopic = String(MQTT_TOPIC_PREFIX) + "/" + MQTT_DEVICE_ID;
+  mqttCommandTopic = mqttBaseTopic + "/command";
+  mqttResultTopic = mqttBaseTopic + "/command-result";
+  mqttAvailabilityTopic = mqttBaseTopic + "/availability";
+  mqttStatusTopic = mqttBaseTopic + "/status";
+  mqttSensorsTopic = mqttBaseTopic + "/sensors";
+  mqttEventTopic = mqttBaseTopic + "/event";
+
+  if (MQTT_TLS_INSECURE)
+  {
+    mqttSecureClient.setInsecure();
+    Serial.println("MQTT cloud warning: TLS certificate verification disabled");
+  }
+  else
+  {
+    mqttSecureClient.setCACert(MQTT_ROOT_CA_PEM);
+  }
+
+  mqttSecureClient.setHandshakeTimeout(5);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(handleMqttMessage);
+  mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+  mqttClient.setKeepAlive(15);
+  mqttClient.setSocketTimeout(1);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+bool connectMqttBridge(unsigned long currentTime)
+{
+  if (!MQTT_ENABLED ||
+      accessPointFallbackActive ||
+      WiFi.status() != WL_CONNECTED ||
+      isMotorRunning ||
+      currentTime - mqttLastConnectAttemptAt < MQTT_RECONNECT_INTERVAL_MS)
+  {
+    return false;
+  }
+
+  mqttLastConnectAttemptAt = currentTime;
+  const String clientId =
+      String("curtain-") + MQTT_DEVICE_ID + "-" +
+      String(static_cast<unsigned long>(ESP.getEfuseMac()), HEX);
+
+  Serial.print("MQTT cloud: connecting to ");
+  Serial.println(MQTT_HOST);
+  const bool connected = mqttClient.connect(
+      clientId.c_str(),
+      MQTT_USERNAME,
+      MQTT_PASSWORD,
+      mqttAvailabilityTopic.c_str(),
+      1,
+      true,
+      "offline");
+
+  if (!connected)
+  {
+    Serial.print("MQTT cloud: connection failed, state ");
+    Serial.println(mqttClient.state());
+    return false;
+  }
+
+  mqttClient.subscribe(mqttCommandTopic.c_str(), 1);
+  mqttClient.publish(mqttAvailabilityTopic.c_str(), "online", true);
+  mqttClient.publish(
+      mqttStatusTopic.c_str(),
+      buildDeviceStatusJson().c_str(),
+      true);
+  mqttClient.publish(
+      mqttSensorsTopic.c_str(),
+      buildSensorStatusJson().c_str(),
+      true);
+  mqttLastStatusPublishedAt = currentTime;
+  mqttLastSensorsSamplePublishedAt = lastSensorReadAt;
+  Serial.println("MQTT cloud: connected");
+  return true;
+}
+
+void updateMqttBridge(unsigned long currentTime)
+{
+  if (!MQTT_ENABLED || accessPointFallbackActive)
+  {
+    return;
+  }
+
+  if (!mqttClient.connected())
+  {
+    connectMqttBridge(currentTime);
+    return;
+  }
+
+  mqttClient.loop();
+
+  // Do not send the large retained snapshots while the motor is moving.
+  // Limit polling stays the highest-priority work; the small command ACK has
+  // already been sent and a fresh snapshot is published immediately after stop.
+  if (isMotorRunning)
+  {
+    return;
+  }
+
+  if (currentTime - mqttLastStatusPublishedAt >= MQTT_IDLE_PUBLISH_INTERVAL_MS)
+  {
+    const String status = buildDeviceStatusJson();
+    mqttClient.publish(mqttStatusTopic.c_str(), status.c_str(), true);
+    mqttLastStatusPublishedAt = currentTime;
+  }
+
+  if (lastSensorReadAt != mqttLastSensorsSamplePublishedAt)
+  {
+    const String sensors = buildSensorStatusJson();
+    mqttClient.publish(mqttSensorsTopic.c_str(), sensors.c_str(), true);
+    mqttLastSensorsSamplePublishedAt = lastSensorReadAt;
+  }
+}
+
 void startNetworkAndServer()
 {
   if (!connectToStation())
@@ -3622,6 +4749,7 @@ void startNetworkAndServer()
   server.on("/health", HTTP_GET, handleHealth);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/sensors", HTTP_GET, handleSensors);
+  server.on("/logs", HTTP_GET, handleDeviceLogs);
   server.on("/auto/status", HTTP_GET, handleAutoStatus);
   server.on("/auto/config", HTTP_POST, handleAutoConfiguration);
   server.on("/auto/model-a", HTTP_POST, handleAutoModelAConfiguration);
@@ -3629,6 +4757,7 @@ void startNetworkAndServer()
   server.on("/auto/disable", HTTP_POST, handleAutoDisable);
 
   server.on("/status", HTTP_OPTIONS, handleCorsPreflight);
+  server.on("/logs", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/auto/status", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/auto/config", HTTP_OPTIONS, handleCorsPreflight);
   server.on("/auto/model-a", HTTP_OPTIONS, handleCorsPreflight);
@@ -3687,6 +4816,7 @@ void startNetworkAndServer()
       handleCorsPreflight);
 
   server.begin();
+  initializeMqttBridge();
 }
 
 void setup()
@@ -3703,6 +4833,12 @@ void setup()
 
   Serial.begin(115200);
   delay(500);
+
+  deviceLogReady = LittleFS.begin(true);
+  Serial.println(
+      deviceLogReady
+          ? "Device log: LittleFS ready"
+          : "Device log: LittleFS unavailable");
 
   stopMotor("restart-manual");
   loadStoredCalibration();
@@ -3738,6 +4874,11 @@ void loop()
       maxWebHandlerUs = webDurationUs;
     }
   }
+
+  updateMqttBridge(millis());
+  currentTime = millis();
+  updateLimitSensors(currentTime);
+  updateLimitSafety();
 
   if (Serial.available() > 0)
   {
@@ -3816,4 +4957,6 @@ void loop()
     updateLimitSafety();
     updateAutoRuntimeAfterSensorRead(currentTime);
   }
+
+  flushPendingDeviceLogEvent();
 }
